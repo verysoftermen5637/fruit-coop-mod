@@ -1,12 +1,13 @@
 /**
  * Fruit Playground Co-op Multiplayer Mod with In-Game & JNI GUI
  * Target: Android ARM64 (Unity IL2CPP 2022.x+ / libil2cpp.so)
+ * Package: com.onristudio.justplayground
  * Architecture: Host-Authoritative Relay Netplay
  * Features:
- *   - Native Android JNI & In-Game GUI for Server IP/Port input
+ *   - Native Android JNI GUI with Thread Looper & Auto-reconnect
  *   - Auto-show at launch & 3-finger touch trigger
  *   - Dynamic socket re-initialization without restarting game
- *   - Auto-save to /sdcard/Android/data/com.fruitplayground.game/coop_config.txt
+ *   - Auto-save to /sdcard/Android/data/com.onristudio.justplayground/coop_config.txt
  *   - Embedded Zero-Dependency AArch64 Inline Hook Engine
  */
 
@@ -255,11 +256,12 @@ static char g_server_ip[64] = "192.168.0.1";
 static int  g_server_port   = 7777;
 
 static JavaVM *g_jvm = nullptr;
+static jclass g_cached_unity_class = nullptr;
 static bool g_dialog_open = false;
 static int g_three_finger_cooldown = 0;
 
-static const char* CONFIG_PRIMARY  = "/sdcard/Android/data/com.fruitplayground.game/coop_config.txt";
-static const char* CONFIG_FALLBACK = "/data/data/com.fruitplayground.game/files/coop_config.txt";
+static const char* CONFIG_PRIMARY  = "/sdcard/Android/data/com.onristudio.justplayground/coop_config.txt";
+static const char* CONFIG_FALLBACK = "/data/data/com.onristudio.justplayground/files/coop_config.txt";
 
 static void load_config() {
     FILE *fp = fopen(CONFIG_PRIMARY, "r");
@@ -295,7 +297,7 @@ static void save_config(const char* ip, int port) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%s:%d\n", ip, port);
 
-    mkdir("/sdcard/Android/data/com.fruitplayground.game", 0777);
+    mkdir("/sdcard/Android/data/com.onristudio.justplayground", 0777);
     FILE *fp = fopen(CONFIG_PRIMARY, "w");
     if (fp) {
         fputs(buf, fp);
@@ -367,7 +369,7 @@ static void send_packet(PacketType type, const void *payload, size_t len) {
 }
 
 // =============================================================================
-// JNI Native Android ShowInputDialog Implementation
+// JNI Native Android ShowInputDialog Implementation with Looper
 // =============================================================================
 static JNIEnv* get_jni_env() {
     if (!g_jvm) {
@@ -395,11 +397,13 @@ static JNIEnv* get_jni_env() {
 
 static jobject get_unity_activity(JNIEnv *env) {
     if (!env) return nullptr;
-    jclass unity_player = env->FindClass("com/unity3d/player/UnityPlayer");
+    jclass unity_player = g_cached_unity_class;
     if (!unity_player) {
+        unity_player = env->FindClass("com/unity3d/player/UnityPlayer");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        return nullptr;
     }
+    if (!unity_player) return nullptr;
+
     jfieldID act_field = env->GetStaticFieldID(unity_player, "currentActivity", "Landroid/app/Activity;");
     if (!act_field) {
         if (env->ExceptionCheck()) env->ExceptionClear();
@@ -417,29 +421,42 @@ void ShowInputDialog() {
         JNIEnv *env = get_jni_env();
         if (!env) { g_dialog_open = false; return nullptr; }
 
+        // 1. Prepare Looper on this thread so Handler and Views can be created safely
+        jclass looperClass = env->FindClass("android/os/Looper");
+        if (looperClass) {
+            jmethodID myLooperMethod = env->GetStaticMethodID(looperClass, "myLooper", "()Landroid/os/Looper;");
+            jobject myLooper = env->CallStaticObjectMethod(looperClass, myLooperMethod);
+            if (!myLooper) {
+                jmethodID prepareMethod = env->GetStaticMethodID(looperClass, "prepare", "()V");
+                env->CallStaticVoidMethod(looperClass, prepareMethod);
+            }
+        }
+
         jobject activity = get_unity_activity(env);
-        if (!activity) { g_dialog_open = false; return nullptr; }
+        if (!activity) {
+            LOGE("Cannot show dialog: Unity currentActivity is null");
+            g_dialog_open = false;
+            return nullptr;
+        }
 
         char current_str[128];
         snprintf(current_str, sizeof(current_str), "%s:%d", g_server_ip, g_server_port);
 
-        // 1. AlertDialog.Builder
+        // 2. AlertDialog.Builder
         jclass builderClass = env->FindClass("android/app/AlertDialog$Builder");
         if (!builderClass) { g_dialog_open = false; return nullptr; }
         jmethodID builderCtor = env->GetMethodID(builderClass, "<init>", "(Landroid/content/Context;)V");
         jobject builder = env->NewObject(builderClass, builderCtor, activity);
 
-        // Title
         jmethodID setTitle = env->GetMethodID(builderClass, "setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;");
         jstring titleStr = env->NewStringUTF("Fruit Playground Co-op Server");
         env->CallObjectMethod(builder, setTitle, titleStr);
 
-        // Message
         jmethodID setMessage = env->GetMethodID(builderClass, "setMessage", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;");
         jstring msgStr = env->NewStringUTF("Введите адрес сервера (IP:Порт):");
         env->CallObjectMethod(builder, setMessage, msgStr);
 
-        // 2. LinearLayout with EditText
+        // 3. Layout with EditText
         jclass layoutClass = env->FindClass("android/widget/LinearLayout");
         jmethodID layoutCtor = env->GetMethodID(layoutClass, "<init>", "(Landroid/content/Context;)V");
         jobject layout = env->NewObject(layoutClass, layoutCtor, activity);
@@ -453,7 +470,7 @@ void ShowInputDialog() {
         jobject editText = env->NewObject(editTextClass, editTextCtor, activity);
 
         jmethodID setHint = env->GetMethodID(editTextClass, "setHint", "(Ljava/lang/CharSequence;)V");
-        jstring hintStr = env->NewStringUTF("Например: 192.168.0.1:7777");
+        jstring hintStr = env->NewStringUTF("192.168.0.1:7777");
         env->CallVoidMethod(editText, setHint, hintStr);
 
         jmethodID setText = env->GetMethodID(editTextClass, "setText", "(Ljava/lang/CharSequence;)V");
@@ -466,7 +483,6 @@ void ShowInputDialog() {
         jmethodID setView = env->GetMethodID(builderClass, "setView", "(Landroid/view/View;)Landroid/app/AlertDialog$Builder;");
         env->CallObjectMethod(builder, setView, layout);
 
-        // Buttons
         jmethodID setPosBtn = env->GetMethodID(builderClass, "setPositiveButton",
             "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;");
         jstring btnApply = env->NewStringUTF("Применить и подключиться");
@@ -477,7 +493,7 @@ void ShowInputDialog() {
         jstring btnCancel = env->NewStringUTF("Отмена");
         env->CallObjectMethod(builder, setNegBtn, btnCancel, nullptr);
 
-        // 3. Create & Show Dialog
+        // 4. Create & Show Dialog
         jmethodID createDialog = env->GetMethodID(builderClass, "create", "()Landroid/app/AlertDialog;");
         jobject dialog = env->CallObjectMethod(builder, createDialog);
 
@@ -488,12 +504,12 @@ void ShowInputDialog() {
         jobject globalDialog = env->NewGlobalRef(dialog);
         jobject globalEditText = env->NewGlobalRef(editText);
 
-        // 4. Polling thread to detect dismissal and extract value
         jmethodID isShowing = env->GetMethodID(dialogClass, "isShowing", "()Z");
         jmethodID getText = env->GetMethodID(editTextClass, "getText", "()Landroid/text/Editable;");
         jclass charSeqClass = env->FindClass("java/lang/CharSequence");
         jmethodID toStr = env->GetMethodID(charSeqClass, "toString", "()Ljava/lang/String;");
 
+        // 5. Poll until dismissed
         while (env->CallBooleanMethod(globalDialog, isShowing)) {
             usleep(150000);
         }
@@ -751,7 +767,16 @@ static uintptr_t get_module_base(const char *module_name) {
 // =============================================================================
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_jvm = vm;
-    LOGI("JNI_OnLoad called, cached JavaVM");
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK && env) {
+        jclass up = env->FindClass("com/unity3d/player/UnityPlayer");
+        if (up) {
+            g_cached_unity_class = (jclass)env->NewGlobalRef(up);
+        } else {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
+    LOGI("JNI_OnLoad called, cached JavaVM & UnityPlayer class");
     return JNI_VERSION_1_6;
 }
 
