@@ -1,0 +1,47 @@
+name: Build Android ARM64 Co-op Mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Download Dobby Hook arm64-v8a
+        run: |
+          mkdir -p dobby/lib dobby/include
+          echo "[*] Fetching Dobby arm64-v8a binary..."
+          curl -L -s -o /tmp/dobby.tar.gz "https://github.com/jmpews/Dobby/releases/download/v1.0.0/dobby-android-all.tar.gz"
+          tar -xzf /tmp/dobby.tar.gz -C /tmp/
+          find /tmp -name "libdobby.a" | grep "arm64" | head -n 1 | xargs -I {} cp {} dobby/lib/libdobby.a
+          find /tmp -name "dobby.h" | head -n 1 | xargs -I {} cp {} dobby/include/dobby.h
+          ls -la dobby/lib/libdobby.a dobby/include/dobby.h
+
+      - name: Compile libcoop_fp.so
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+
+      - name: Verify Binary
+        run: |
+          ls -lh build/libcoop_fp.so
+          file build/libcoop_fp.so
+
+      - name: Upload libcoop_fp.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcoop_fp_arm64
+          path: build/libcoop_fp.so
