@@ -2,7 +2,7 @@
  * Fruit Playground Co-op Multiplayer Mod
  * Target: Android ARM64 (Unity IL2CPP 2022.x+ / libil2cpp.so)
  * Architecture: Host-Authoritative Relay Netplay
- * Hooking Engine: Dobby Hook (or And64InlineHook)
+ * Hooking Engine: Standalone AArch64 Trampoline Hook
  */
 
 #include <jni.h>
@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <android/log.h>
+#include <sys/mman.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,10 +31,59 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // =============================================================================
-// Dobby Hook Prototypes
+// Standalone ARM64 Inline Hook Engine (Zero external dependencies)
 // =============================================================================
-extern "C" {
-    int DobbyHook(void *function_address, void *new_func, void **old_func);
+extern "C" int DobbyHook(void *function_address, void *new_func, void **old_func) {
+    if (!function_address || !new_func) return -1;
+
+    uintptr_t target = reinterpret_cast<uintptr_t>(function_address);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    uintptr_t page_start = target & ~(page_size - 1);
+
+    // 1. Create trampoline to call original function
+    if (old_func) {
+        void *trampoline = mmap(nullptr, 64, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (trampoline != MAP_FAILED) {
+            uint8_t *t_ptr = reinterpret_cast<uint8_t*>(trampoline);
+
+            // Copy first 16 bytes (4 ARM64 instructions)
+            memcpy(t_ptr, reinterpret_cast<void*>(target), 16);
+
+            // Append jump back to (target + 16):
+            // ldr x17, #8   (0x58000051)
+            // br  x17       (0xd61f0220)
+            // .quad target + 16
+            uint32_t *jump_back = reinterpret_cast<uint32_t*>(t_ptr + 16);
+            jump_back[0] = 0x58000051;
+            jump_back[1] = 0xd61f0220;
+            *reinterpret_cast<uint64_t*>(t_ptr + 24) = target + 16;
+
+            __builtin___clear_cache(reinterpret_cast<char*>(t_ptr), reinterpret_cast<char*>(t_ptr + 32));
+            *old_func = trampoline;
+        }
+    }
+
+    // 2. Unprotect target page
+    if (mprotect(reinterpret_cast<void*>(page_start), page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -1;
+    }
+
+    // 3. Write 16-byte absolute detour:
+    // ldr x17, #8   (0x58000051)
+    // br  x17       (0xd61f0220)
+    // .quad new_func
+    uint32_t *target_insn = reinterpret_cast<uint32_t*>(target);
+    target_insn[0] = 0x58000051;
+    target_insn[1] = 0xd61f0220;
+    *reinterpret_cast<uint64_t*>(target + 8) = reinterpret_cast<uint64_t>(new_func);
+
+    // 4. Flush I-cache and re-protect
+    __builtin___clear_cache(reinterpret_cast<char*>(target), reinterpret_cast<char*>(target + 16));
+    mprotect(reinterpret_cast<void*>(page_start), page_size * 2, PROT_READ | PROT_EXEC);
+
+    return 0;
 }
 
 // =============================================================================
@@ -167,7 +217,6 @@ struct DragTool_o : Il2CppObject {
 
 // SliceController : MonoBehaviour
 struct SliceController_o : Il2CppObject {
-    // standard Mono fields
 };
 
 // =============================================================================
@@ -377,8 +426,6 @@ static void hook_LivingPart_FixedUpdate(LivingPart_o *part, void *method) {
             if (it != g_object_to_net.end()) {
                 PhysicsObjectSync sync{};
                 sync.netId = it->second;
-                // Read position from Transform or Rigidbody2D
-                // sync.posX = ...; sync.posY = ...;
                 send_packet(PKT_PHYSICS_SYNC, &sync, sizeof(sync));
             }
         }
@@ -466,7 +513,6 @@ static void* net_receive_thread(void *arg) {
                     const PktSpawn *s = reinterpret_cast<const PktSpawn*>(payload);
                     LOGI("[Net] Received Spawn packet: NetId=%u, ItemId=%d at (%.2f, %.2f)",
                          s->netId, s->itemId, s->posX, s->posY);
-                    // Spawn puppet or proxy object on client
                 }
                 break;
             }
@@ -509,7 +555,7 @@ void init_coop_mod() {
         LOGI("Network thread started successfully");
     }
 
-    // Install Dobby Hooks using resolved RVAs
+    // Install Hooks using resolved RVAs
     #define INSTALL_HOOK(target_rva, hook_fn, orig_ptr) \
         DobbyHook((void*)(g_il2cpp_base + target_rva), (void*)hook_fn, (void**)&orig_ptr);
 
