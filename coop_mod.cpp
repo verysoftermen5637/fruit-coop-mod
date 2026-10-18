@@ -1,8 +1,13 @@
 /**
- * Fruit Playground Co-op Multiplayer Mod
+ * Fruit Playground Co-op Multiplayer Mod with In-Game & JNI GUI
  * Target: Android ARM64 (Unity IL2CPP 2022.x+ / libil2cpp.so)
  * Architecture: Host-Authoritative Relay Netplay
- * Hooking Engine: Standalone AArch64 Trampoline Hook
+ * Features:
+ *   - Native Android JNI & In-Game GUI for Server IP/Port input
+ *   - Auto-show at launch & 3-finger touch trigger
+ *   - Dynamic socket re-initialization without restarting game
+ *   - Auto-save to /sdcard/Android/data/com.fruitplayground.game/coop_config.txt
+ *   - Embedded Zero-Dependency AArch64 Inline Hook Engine
  */
 
 #include <jni.h>
@@ -15,6 +20,7 @@
 #include <fcntl.h>
 #include <android/log.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -97,44 +103,28 @@ namespace Offsets {
     constexpr uintptr_t DragTool_StartDrag       = 0x28C8194;
     constexpr uintptr_t DragTool_MoveDragger     = 0x28C8C40;
     constexpr uintptr_t DragTool_EndDrag         = 0x28C86B0;
+    constexpr uintptr_t DragTool_Update          = 0x28C7760;
     constexpr uintptr_t LivingPart_FixedUpdate   = 0x2868484;
     constexpr uintptr_t LivingPart_BreakPart     = 0x2869030;
     constexpr uintptr_t LivingBehaviour_Damage   = 0x2864DEC;
     constexpr uintptr_t LivingBehaviour_Kill     = 0x28651A8;
     constexpr uintptr_t SliceController_SliceAll = 0x288A6C0;
     constexpr uintptr_t GameInput_get_WorldPos   = 0x2965C68;
-    constexpr uintptr_t HumanoidBehaviour_Walk   = 0x2860B30;
-    constexpr uintptr_t HumanoidBehaviour_Jump   = 0x2861160;
+    constexpr uintptr_t UnityEngine_Input_touchCount = 0x5483A78;
 }
 
 // =============================================================================
 // Unity & Game Struct Representations
 // =============================================================================
-struct Vector2 {
-    float x;
-    float y;
-};
+struct Vector2 { float x, y; };
+struct Vector3 { float x, y, z; };
+struct Quaternion { float x, y, z, w; };
 
-struct Vector3 {
-    float x;
-    float y;
-    float z;
-};
-
-struct Quaternion {
-    float x;
-    float y;
-    float z;
-    float w;
-};
-
-// Generic IL2CPP Object Header
 struct Il2CppObject {
     void *klass;
     void *monitor;
 };
 
-// ItemData : ScriptableObject
 struct ItemData_o : Il2CppObject {
     void *prefab;            // 0x18
     void *itemName;          // 0x20
@@ -147,7 +137,6 @@ struct ItemData_o : Il2CppObject {
     bool isLocked;           // 0x50
 };
 
-// SpawnManager : MonoBehaviour
 struct SpawnManager_o : Il2CppObject {
     uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
     bool isFlipped;          // 0x20
@@ -156,56 +145,11 @@ struct SpawnManager_o : Il2CppObject {
     ItemData_o *selectedObject; // 0x28
 };
 
-// PhysicalBehaviour : MonoBehaviour
-struct PhysicalBehaviour_o : Il2CppObject {
-    uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
-    int32_t itemID;          // 0x20
-    bool isMod;              // 0x24
-    uint8_t pad_25[3];
-    void *modFileName;       // 0x28
-    void *modUuid;           // 0x30
-    int32_t materialType;    // 0x38
-    uint8_t pad_3C[4];
-    void *weaponBehaviour;   // 0x40
-    void *modularObject;     // 0x48
-    void *rb;                // 0x50 (Rigidbody2D)
-    void *objectMediator;    // 0x58
-    void *storedData;        // 0x60
-    void *audioSource;       // 0x68
-    void *living;            // 0x70 (LivingBehaviour)
-    void *destruction;       // 0x78 (DestructionBehaviour)
-    uint8_t pad_80[0x138 - 0x80];
-    void *tr;                // 0x138 (Transform)
-};
-
-// LivingPart : MonoBehaviour
-struct LivingPart_o : Il2CppObject {
-    uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
-    void *humanBeh;          // 0x20
-    uint8_t pad_28[0xE8 - 0x28];
-    void *rb;                // 0xE8 (Rigidbody2D)
-    PhysicalBehaviour_o *po; // 0xF0
-    void *_transform;        // 0xF8 (Transform)
-};
-
-// LivingBehaviour : MonoBehaviour
-struct LivingBehaviour_o : Il2CppObject {
-    uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
-    float maxHealth;         // 0x20
-    float health;            // 0x24
-    float oxygen;            // 0x28
-    float bleedingMultiplier;// 0x2C
-    bool isVital;            // 0x30
-    bool isLimb;             // 0x31
-    uint8_t pad_32[6];
-};
-
-// DragTool : MonoBehaviour
 struct DragTool_o : Il2CppObject {
     uint8_t pad_mono[0x60 - sizeof(Il2CppObject)];
-    PhysicalBehaviour_o *draggedPhysicalBehaviour; // 0x60
-    void *joint;             // 0x68 (TargetJoint2D)
-    void *rb;                // 0x70 (Rigidbody2D)
+    void *draggedPhysicalBehaviour; // 0x60
+    void *joint;             // 0x68
+    void *rb;                // 0x70
     bool isDrag;             // 0x78
     bool isRotate;           // 0x79
     bool canDrag;            // 0x7A
@@ -215,9 +159,22 @@ struct DragTool_o : Il2CppObject {
     Vector2 screenPosition;  // 0x90
 };
 
-// SliceController : MonoBehaviour
-struct SliceController_o : Il2CppObject {
+struct LivingPart_o : Il2CppObject {
+    uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
+    void *humanBeh;          // 0x20
+    uint8_t pad_28[0xE8 - 0x28];
+    void *rb;                // 0xE8
+    void *po;                // 0xF0
+    void *_transform;        // 0xF8
 };
+
+struct LivingBehaviour_o : Il2CppObject {
+    uint8_t pad_mono[0x20 - sizeof(Il2CppObject)];
+    float maxHealth;         // 0x20
+    float health;            // 0x24
+};
+
+struct SliceController_o : Il2CppObject {};
 
 // =============================================================================
 // Network Protocol Definitions (Host-Authoritative)
@@ -229,8 +186,6 @@ enum PacketType : uint8_t {
     PKT_DRAG           = 4,
     PKT_CURSOR         = 5,
     PKT_SLICE          = 6,
-    PKT_DAMAGE         = 7,
-    PKT_BREAK_PART     = 8,
     PKT_CLEAR_WORLD    = 9
 };
 
@@ -280,20 +235,10 @@ struct PktSlice {
     float x1, y1;
     float x2, y2;
 };
-
-struct PktDamage {
-    uint32_t netId;
-    float    amount;
-};
-
-struct PktBreakPart {
-    uint32_t netId;
-    uint32_t partIndex;
-};
 #pragma pack(pop)
 
 // =============================================================================
-// Global State & Networking
+// Global State & Configuration Persistence
 // =============================================================================
 static uintptr_t g_il2cpp_base = 0;
 static bool g_is_host = true;
@@ -305,22 +250,106 @@ static uint32_t g_next_net_id = 1;
 static std::unordered_map<uint32_t, void*> g_net_to_object;
 static std::unordered_map<void*, uint32_t> g_object_to_net;
 static Vector2 g_remote_cursor = {0, 0};
-static bool g_remote_cursor_down = false;
 
-// Helper to resolve base address of libil2cpp.so from /proc/self/maps
-static uintptr_t get_module_base(const char *module_name) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
-    char line[512];
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, module_name)) {
-            base = strtoull(line, nullptr, 16);
-            break;
+static char g_server_ip[64] = "192.168.0.1";
+static int  g_server_port   = 7777;
+
+static JavaVM *g_jvm = nullptr;
+static bool g_dialog_open = false;
+static int g_three_finger_cooldown = 0;
+
+static const char* CONFIG_PRIMARY  = "/sdcard/Android/data/com.fruitplayground.game/coop_config.txt";
+static const char* CONFIG_FALLBACK = "/data/data/com.fruitplayground.game/files/coop_config.txt";
+
+static void load_config() {
+    FILE *fp = fopen(CONFIG_PRIMARY, "r");
+    if (!fp) fp = fopen(CONFIG_FALLBACK, "r");
+    if (fp) {
+        char line[128] = {0};
+        if (fgets(line, sizeof(line), fp)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            char *nl = strchr(p, '\n');
+            if (nl) *nl = '\0';
+            nl = strchr(p, '\r');
+            if (nl) *nl = '\0';
+
+            char *colon = strchr(p, ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(g_server_ip, p, sizeof(g_server_ip) - 1);
+                int p_val = atoi(colon + 1);
+                if (p_val > 0 && p_val < 65536) g_server_port = p_val;
+            } else if (strlen(p) > 0) {
+                strncpy(g_server_ip, p, sizeof(g_server_ip) - 1);
+            }
         }
+        fclose(fp);
+        LOGI("Loaded config from file: %s:%d", g_server_ip, g_server_port);
+    } else {
+        LOGI("No config file found. Using default: %s:%d", g_server_ip, g_server_port);
     }
-    fclose(fp);
-    return base;
+}
+
+static void save_config(const char* ip, int port) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s:%d\n", ip, port);
+
+    mkdir("/sdcard/Android/data/com.fruitplayground.game", 0777);
+    FILE *fp = fopen(CONFIG_PRIMARY, "w");
+    if (fp) {
+        fputs(buf, fp);
+        fclose(fp);
+        LOGI("Saved config to %s", CONFIG_PRIMARY);
+    }
+
+    FILE *fp2 = fopen(CONFIG_FALLBACK, "w");
+    if (fp2) {
+        fputs(buf, fp2);
+        fclose(fp2);
+        LOGI("Saved config to %s", CONFIG_FALLBACK);
+    }
+}
+
+// Re-initializes socket connection dynamically with new IP/port
+static void reconnect_socket(const char* new_ip, int new_port) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    LOGI("[Net] Reconnecting socket to %s:%d...", new_ip, new_port);
+
+    if (g_sock_fd >= 0) {
+        close(g_sock_fd);
+        g_sock_fd = -1;
+    }
+
+    strncpy(g_server_ip, new_ip, sizeof(g_server_ip) - 1);
+    g_server_port = new_port;
+
+    g_sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_sock_fd >= 0) {
+        memset(&g_server_addr, 0, sizeof(g_server_addr));
+        g_server_addr.sin_family = AF_INET;
+        g_server_addr.sin_port = htons(g_server_port);
+        inet_pton(AF_INET, g_server_ip, &g_server_addr.sin_addr);
+
+        PktHandshake hs{};
+        hs.isHost = g_is_host ? 1 : 0;
+        strncpy(hs.roomId, "default", sizeof(hs.roomId) - 1);
+
+        std::vector<uint8_t> buffer(sizeof(NetHeader) + sizeof(hs));
+        NetHeader *hdr = reinterpret_cast<NetHeader*>(buffer.data());
+        hdr->magic = 0x4650434F;
+        hdr->type = PKT_HANDSHAKE;
+        hdr->length = sizeof(hs);
+        memcpy(buffer.data() + sizeof(NetHeader), &hs, sizeof(hs));
+
+        sendto(g_sock_fd, buffer.data(), buffer.size(), 0,
+               (struct sockaddr*)&g_server_addr, sizeof(g_server_addr));
+
+        save_config(g_server_ip, g_server_port);
+        LOGI("[Net] Reconnected and sent Handshake to %s:%d", g_server_ip, g_server_port);
+    } else {
+        LOGE("[Net] Failed to create socket during reconnect");
+    }
 }
 
 static void send_packet(PacketType type, const void *payload, size_t len) {
@@ -338,6 +367,171 @@ static void send_packet(PacketType type, const void *payload, size_t len) {
 }
 
 // =============================================================================
+// JNI Native Android ShowInputDialog Implementation
+// =============================================================================
+static JNIEnv* get_jni_env() {
+    if (!g_jvm) {
+        void *art = dlopen("libart.so", RTLD_NOW);
+        if (art) {
+            typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+            auto get_vms = (JNI_GetCreatedJavaVMs_t)dlsym(art, "JNI_GetCreatedJavaVMs");
+            if (get_vms) {
+                JavaVM *vms[1];
+                jsize num = 0;
+                if (get_vms(vms, 1, &num) == JNI_OK && num > 0) {
+                    g_jvm = vms[0];
+                }
+            }
+        }
+    }
+    if (!g_jvm) return nullptr;
+    JNIEnv *env = nullptr;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+    }
+    return env;
+}
+
+static jobject get_unity_activity(JNIEnv *env) {
+    if (!env) return nullptr;
+    jclass unity_player = env->FindClass("com/unity3d/player/UnityPlayer");
+    if (!unity_player) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jfieldID act_field = env->GetStaticFieldID(unity_player, "currentActivity", "Landroid/app/Activity;");
+    if (!act_field) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    return env->GetStaticObjectField(unity_player, act_field);
+}
+
+void ShowInputDialog() {
+    if (g_dialog_open) return;
+    g_dialog_open = true;
+
+    pthread_t dlg_tid;
+    pthread_create(&dlg_tid, nullptr, [](void*) -> void* {
+        JNIEnv *env = get_jni_env();
+        if (!env) { g_dialog_open = false; return nullptr; }
+
+        jobject activity = get_unity_activity(env);
+        if (!activity) { g_dialog_open = false; return nullptr; }
+
+        char current_str[128];
+        snprintf(current_str, sizeof(current_str), "%s:%d", g_server_ip, g_server_port);
+
+        // 1. AlertDialog.Builder
+        jclass builderClass = env->FindClass("android/app/AlertDialog$Builder");
+        if (!builderClass) { g_dialog_open = false; return nullptr; }
+        jmethodID builderCtor = env->GetMethodID(builderClass, "<init>", "(Landroid/content/Context;)V");
+        jobject builder = env->NewObject(builderClass, builderCtor, activity);
+
+        // Title
+        jmethodID setTitle = env->GetMethodID(builderClass, "setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;");
+        jstring titleStr = env->NewStringUTF("Fruit Playground Co-op Server");
+        env->CallObjectMethod(builder, setTitle, titleStr);
+
+        // Message
+        jmethodID setMessage = env->GetMethodID(builderClass, "setMessage", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;");
+        jstring msgStr = env->NewStringUTF("Введите адрес сервера (IP:Порт):");
+        env->CallObjectMethod(builder, setMessage, msgStr);
+
+        // 2. LinearLayout with EditText
+        jclass layoutClass = env->FindClass("android/widget/LinearLayout");
+        jmethodID layoutCtor = env->GetMethodID(layoutClass, "<init>", "(Landroid/content/Context;)V");
+        jobject layout = env->NewObject(layoutClass, layoutCtor, activity);
+        jmethodID setOrientation = env->GetMethodID(layoutClass, "setOrientation", "(I)V");
+        env->CallVoidMethod(layout, setOrientation, 1);
+        jmethodID setPadding = env->GetMethodID(layoutClass, "setPadding", "(IIII)V");
+        env->CallVoidMethod(layout, setPadding, 50, 20, 50, 20);
+
+        jclass editTextClass = env->FindClass("android/widget/EditText");
+        jmethodID editTextCtor = env->GetMethodID(editTextClass, "<init>", "(Landroid/content/Context;)V");
+        jobject editText = env->NewObject(editTextClass, editTextCtor, activity);
+
+        jmethodID setHint = env->GetMethodID(editTextClass, "setHint", "(Ljava/lang/CharSequence;)V");
+        jstring hintStr = env->NewStringUTF("Например: 192.168.0.1:7777");
+        env->CallVoidMethod(editText, setHint, hintStr);
+
+        jmethodID setText = env->GetMethodID(editTextClass, "setText", "(Ljava/lang/CharSequence;)V");
+        jstring initText = env->NewStringUTF(current_str);
+        env->CallVoidMethod(editText, setText, initText);
+
+        jmethodID addView = env->GetMethodID(layoutClass, "addView", "(Landroid/view/View;)V");
+        env->CallVoidMethod(layout, addView, editText);
+
+        jmethodID setView = env->GetMethodID(builderClass, "setView", "(Landroid/view/View;)Landroid/app/AlertDialog$Builder;");
+        env->CallObjectMethod(builder, setView, layout);
+
+        // Buttons
+        jmethodID setPosBtn = env->GetMethodID(builderClass, "setPositiveButton",
+            "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;");
+        jstring btnApply = env->NewStringUTF("Применить и подключиться");
+        env->CallObjectMethod(builder, setPosBtn, btnApply, nullptr);
+
+        jmethodID setNegBtn = env->GetMethodID(builderClass, "setNegativeButton",
+            "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;");
+        jstring btnCancel = env->NewStringUTF("Отмена");
+        env->CallObjectMethod(builder, setNegBtn, btnCancel, nullptr);
+
+        // 3. Create & Show Dialog
+        jmethodID createDialog = env->GetMethodID(builderClass, "create", "()Landroid/app/AlertDialog;");
+        jobject dialog = env->CallObjectMethod(builder, createDialog);
+
+        jclass dialogClass = env->FindClass("android/app/AlertDialog");
+        jmethodID showDialog = env->GetMethodID(dialogClass, "show", "()V");
+        env->CallVoidMethod(dialog, showDialog);
+
+        jobject globalDialog = env->NewGlobalRef(dialog);
+        jobject globalEditText = env->NewGlobalRef(editText);
+
+        // 4. Polling thread to detect dismissal and extract value
+        jmethodID isShowing = env->GetMethodID(dialogClass, "isShowing", "()Z");
+        jmethodID getText = env->GetMethodID(editTextClass, "getText", "()Landroid/text/Editable;");
+        jclass charSeqClass = env->FindClass("java/lang/CharSequence");
+        jmethodID toStr = env->GetMethodID(charSeqClass, "toString", "()Ljava/lang/String;");
+
+        while (env->CallBooleanMethod(globalDialog, isShowing)) {
+            usleep(150000);
+        }
+
+        jobject editable = env->CallObjectMethod(globalEditText, getText);
+        if (editable) {
+            jstring strObj = (jstring)env->CallObjectMethod(editable, toStr);
+            if (strObj) {
+                const char *utf = env->GetStringUTFChars(strObj, nullptr);
+                if (utf && strlen(utf) > 0) {
+                    char new_ip[64] = {0};
+                    int new_port = 7777;
+                    char temp[128];
+                    strncpy(temp, utf, sizeof(temp) - 1);
+                    char *colon = strchr(temp, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        strncpy(new_ip, temp, sizeof(new_ip) - 1);
+                        new_port = atoi(colon + 1);
+                        if (new_port <= 0 || new_port > 65535) new_port = 7777;
+                    } else {
+                        strncpy(new_ip, temp, sizeof(new_ip) - 1);
+                    }
+                    reconnect_socket(new_ip, new_port);
+                }
+                env->ReleaseStringUTFChars(strObj, utf);
+            }
+        }
+
+        env->DeleteGlobalRef(globalDialog);
+        env->DeleteGlobalRef(globalEditText);
+        g_dialog_open = false;
+        return nullptr;
+    }, nullptr);
+    pthread_detach(dlg_tid);
+}
+
+// =============================================================================
 // Trampolines and Original Function Pointers
 // =============================================================================
 static void (*orig_SpawnManager_Spawn)(SpawnManager_o*, void*) = nullptr;
@@ -346,25 +540,45 @@ static void (*orig_ActionManager_ClearWorld)(void*, bool, void*) = nullptr;
 static void (*orig_DragTool_StartDrag)(DragTool_o*, void*) = nullptr;
 static void (*orig_DragTool_MoveDragger)(DragTool_o*, bool, void*) = nullptr;
 static void (*orig_DragTool_EndDrag)(DragTool_o*, void*) = nullptr;
+static void (*orig_DragTool_Update)(DragTool_o*, void*) = nullptr;
 static void (*orig_LivingPart_FixedUpdate)(LivingPart_o*, void*) = nullptr;
-static void (*orig_LivingPart_BreakPart)(LivingPart_o*, bool, void*) = nullptr;
-static void (*orig_LivingBehaviour_Damage)(LivingBehaviour_o*, float, bool, bool, bool, float, void*) = nullptr;
 static void (*orig_SliceController_SliceAll)(SliceController_o*, Vector2, Vector2, void*) = nullptr;
 static Vector3 (*orig_GameInput_get_WorldPos)(void*) = nullptr;
+static int (*orig_get_touchCount)() = nullptr;
 
 // =============================================================================
 // Hook Implementations
 // =============================================================================
 
-// 1. Hook on Object Spawning
+// Three-finger touch detection in DragTool_Update
+static void hook_DragTool_Update(DragTool_o *tool, void *method) {
+    orig_DragTool_Update(tool, method);
+
+    if (g_three_finger_cooldown > 0) {
+        g_three_finger_cooldown--;
+    } else {
+        if (!orig_get_touchCount && g_il2cpp_base) {
+            orig_get_touchCount = (int(*)())(g_il2cpp_base + Offsets::UnityEngine_Input_touchCount);
+        }
+        if (orig_get_touchCount) {
+            int touches = orig_get_touchCount();
+            if (touches >= 3 && !g_dialog_open) {
+                g_three_finger_cooldown = 90; // Cooldown 1.5s
+                LOGI("Three-finger touch detected! Opening Server IP Dialog...");
+                ShowInputDialog();
+            }
+        }
+    }
+}
+
+// Hook on Object Spawning
 static void hook_SpawnManager_Spawn(SpawnManager_o *mgr, void *method) {
     if (!mgr) return;
 
     if (!g_is_host) {
-        // Client requests spawn from Host
         if (mgr->selectedObject) {
             PktSpawn req{};
-            req.netId = 0; // Host will assign
+            req.netId = 0;
             req.itemId = mgr->selectedObject->itemId;
             Vector3 worldPos = orig_GameInput_get_WorldPos(nullptr);
             req.posX = worldPos.x;
@@ -373,14 +587,12 @@ static void hook_SpawnManager_Spawn(SpawnManager_o *mgr, void *method) {
             send_packet(PKT_SPAWN, &req, sizeof(req));
             LOGI("[Client] Requested spawn item ID: %d at (%.2f, %.2f)", req.itemId, req.posX, req.posY);
         }
-        return; // Do not spawn locally; wait for host authoritative packet
+        return;
     }
-
-    // Host executes spawn directly
     orig_SpawnManager_Spawn(mgr, method);
 }
 
-// 2. Intercept Object Registration to Assign Network ID
+// Intercept Object Registration to Assign Network ID
 static void hook_ActionManager_AddObject(void *gameObj, void *method) {
     orig_ActionManager_AddObject(gameObj, method);
 
@@ -396,31 +608,28 @@ static void hook_ActionManager_AddObject(void *gameObj, void *method) {
         pkt.posX = worldPos.x;
         pkt.posY = worldPos.y;
         pkt.rotZ = 0.0f;
-        pkt.itemId = 0; // default item
+        pkt.itemId = 0;
         send_packet(PKT_SPAWN, &pkt, sizeof(pkt));
-        LOGI("[Host] Object spawned and registered with NetId: %u", netId);
     }
 }
 
-// 3. Clear World Hook
+// Clear World Hook
 static void hook_ActionManager_ClearWorld(void *mgr, bool resetContraption, void *method) {
     orig_ActionManager_ClearWorld(mgr, resetContraption, method);
     if (g_is_host) {
         send_packet(PKT_CLEAR_WORLD, nullptr, 0);
-        LOGI("[Host] World cleared, broadcasted to client");
     }
 }
 
-// 4. Physics Tick Hook (Host broadcasts bone and body transforms)
+// Physics Tick Hook
 static void hook_LivingPart_FixedUpdate(LivingPart_o *part, void *method) {
     orig_LivingPart_FixedUpdate(part, method);
 
     if (!part) return;
 
     if (g_is_host) {
-        // Host streams physics state periodically
         static int tick = 0;
-        if (++tick % 2 == 0) { // 30Hz broadcast under 60Hz physics
+        if (++tick % 2 == 0) {
             std::lock_guard<std::mutex> lock(g_state_mutex);
             auto it = g_object_to_net.find(part);
             if (it != g_object_to_net.end()) {
@@ -432,14 +641,11 @@ static void hook_LivingPart_FixedUpdate(LivingPart_o *part, void *method) {
     }
 }
 
-// 5. Drag Tool Hooks (Client sends drag requests; Host applies forces)
+// Drag Tool Hooks
 static void hook_DragTool_StartDrag(DragTool_o *tool, void *method) {
     orig_DragTool_StartDrag(tool, method);
     if (!g_is_host && tool) {
-        PktDrag dragPkt{};
-        dragPkt.action = 0; // Start
-        dragPkt.posX = tool->worldPosition.x;
-        dragPkt.posY = tool->worldPosition.y;
+        PktDrag dragPkt{0, 0, tool->worldPosition.x, tool->worldPosition.y};
         send_packet(PKT_DRAG, &dragPkt, sizeof(dragPkt));
     }
 }
@@ -447,10 +653,7 @@ static void hook_DragTool_StartDrag(DragTool_o *tool, void *method) {
 static void hook_DragTool_MoveDragger(DragTool_o *tool, bool touch, void *method) {
     orig_DragTool_MoveDragger(tool, touch, method);
     if (!g_is_host && tool && tool->isDrag) {
-        PktDrag dragPkt{};
-        dragPkt.action = 1; // Move
-        dragPkt.posX = tool->worldPosition.x;
-        dragPkt.posY = tool->worldPosition.y;
+        PktDrag dragPkt{0, 1, tool->worldPosition.x, tool->worldPosition.y};
         send_packet(PKT_DRAG, &dragPkt, sizeof(dragPkt));
     }
 }
@@ -458,21 +661,19 @@ static void hook_DragTool_MoveDragger(DragTool_o *tool, bool touch, void *method
 static void hook_DragTool_EndDrag(DragTool_o *tool, void *method) {
     orig_DragTool_EndDrag(tool, method);
     if (!g_is_host && tool) {
-        PktDrag dragPkt{};
-        dragPkt.action = 2; // End
+        PktDrag dragPkt{0, 2, 0, 0};
         send_packet(PKT_DRAG, &dragPkt, sizeof(dragPkt));
     }
 }
 
-// 6. Slice Hook (Broadcast slice cuts)
+// Slice Hook
 static void hook_SliceController_SliceAll(SliceController_o *ctrl, Vector2 a, Vector2 b, void *method) {
     orig_SliceController_SliceAll(ctrl, a, b, method);
     PktSlice pkt{a.x, a.y, b.x, b.y};
     send_packet(PKT_SLICE, &pkt, sizeof(pkt));
-    LOGI("Slice triggered from (%.2f, %.2f) to (%.2f, %.2f)", a.x, a.y, b.x, b.y);
 }
 
-// 7. Input Hook (Stream local cursor coordinates for remote visualization)
+// Input Hook (Cursor streaming)
 static Vector3 hook_GameInput_get_WorldPos(void *method) {
     Vector3 pos = orig_GameInput_get_WorldPos(method);
     static int cursorTick = 0;
@@ -488,7 +689,11 @@ static Vector3 hook_GameInput_get_WorldPos(void *method) {
 // =============================================================================
 static void* net_receive_thread(void *arg) {
     uint8_t buffer[2048];
-    while (g_sock_fd >= 0) {
+    while (true) {
+        if (g_sock_fd < 0) {
+            usleep(100000);
+            continue;
+        }
         sockaddr_in from{};
         socklen_t fromLen = sizeof(from);
         ssize_t n = recvfrom(g_sock_fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&from, &fromLen);
@@ -504,14 +709,13 @@ static void* net_receive_thread(void *arg) {
                     const PktCursor *c = reinterpret_cast<const PktCursor*>(payload);
                     g_remote_cursor.x = c->posX;
                     g_remote_cursor.y = c->posY;
-                    g_remote_cursor_down = (c->isPressed != 0);
                 }
                 break;
             }
             case PKT_SPAWN: {
                 if (hdr->length >= sizeof(PktSpawn)) {
                     const PktSpawn *s = reinterpret_cast<const PktSpawn*>(payload);
-                    LOGI("[Net] Received Spawn packet: NetId=%u, ItemId=%d at (%.2f, %.2f)",
+                    LOGI("[Net] Spawn packet: NetId=%u, ItemId=%d at (%.2f, %.2f)",
                          s->netId, s->itemId, s->posX, s->posY);
                 }
                 break;
@@ -527,49 +731,76 @@ static void* net_receive_thread(void *arg) {
     return nullptr;
 }
 
+static uintptr_t get_module_base(const char *module_name) {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, module_name)) {
+            base = strtoull(line, nullptr, 16);
+            break;
+        }
+    }
+    fclose(fp);
+    return base;
+}
+
 // =============================================================================
 // Library Entrypoint & Hook Initialization
 // =============================================================================
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+    g_jvm = vm;
+    LOGI("JNI_OnLoad called, cached JavaVM");
+    return JNI_VERSION_1_6;
+}
+
 __attribute__((constructor))
 void init_coop_mod() {
     LOGI("Fruit Playground Co-op Mod loading...");
 
-    // Wait for libil2cpp.so to load
-    while (g_il2cpp_base == 0) {
-        g_il2cpp_base = get_module_base("libil2cpp.so");
-        if (!g_il2cpp_base) usleep(100000);
-    }
-    LOGI("libil2cpp.so located at base: 0x%lx", g_il2cpp_base);
+    load_config();
 
-    // Initialize UDP network socket
-    g_sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (g_sock_fd >= 0) {
-        memset(&g_server_addr, 0, sizeof(g_server_addr));
-        g_server_addr.sin_family = AF_INET;
-        g_server_addr.sin_port = htons(7777);
-        inet_pton(AF_INET, "192.168.0.1", &g_server_addr.sin_addr);
+    // Background thread to wait for libil2cpp and initialize hooks
+    pthread_t init_thread;
+    pthread_create(&init_thread, nullptr, [](void*) -> void* {
+        while (g_il2cpp_base == 0) {
+            g_il2cpp_base = get_module_base("libil2cpp.so");
+            if (!g_il2cpp_base) usleep(100000);
+        }
+        LOGI("libil2cpp.so located at base: 0x%lx", g_il2cpp_base);
 
-        pthread_t tid;
-        pthread_create(&tid, nullptr, net_receive_thread, nullptr);
-        pthread_detach(tid);
-        LOGI("Network thread started successfully");
-    }
+        // Initial socket connection
+        reconnect_socket(g_server_ip, g_server_port);
 
-    // Install Hooks using resolved RVAs
-    #define INSTALL_HOOK(target_rva, hook_fn, orig_ptr) \
-        DobbyHook((void*)(g_il2cpp_base + target_rva), (void*)hook_fn, (void**)&orig_ptr);
+        // Start background UDP receiver
+        pthread_t net_tid;
+        pthread_create(&net_tid, nullptr, net_receive_thread, nullptr);
+        pthread_detach(net_tid);
 
-    INSTALL_HOOK(Offsets::SpawnManager_Spawn,       hook_SpawnManager_Spawn,       orig_SpawnManager_Spawn);
-    INSTALL_HOOK(Offsets::ActionManager_AddObject,  hook_ActionManager_AddObject,  orig_ActionManager_AddObject);
-    INSTALL_HOOK(Offsets::ActionManager_ClearWorld, hook_ActionManager_ClearWorld, orig_ActionManager_ClearWorld);
-    INSTALL_HOOK(Offsets::DragTool_StartDrag,       hook_DragTool_StartDrag,       orig_DragTool_StartDrag);
-    INSTALL_HOOK(Offsets::DragTool_MoveDragger,     hook_DragTool_MoveDragger,     orig_DragTool_MoveDragger);
-    INSTALL_HOOK(Offsets::DragTool_EndDrag,         hook_DragTool_EndDrag,         orig_DragTool_EndDrag);
-    INSTALL_HOOK(Offsets::LivingPart_FixedUpdate,   hook_LivingPart_FixedUpdate,   orig_LivingPart_FixedUpdate);
-    INSTALL_HOOK(Offsets::SliceController_SliceAll, hook_SliceController_SliceAll, orig_SliceController_SliceAll);
-    INSTALL_HOOK(Offsets::GameInput_get_WorldPos,   hook_GameInput_get_WorldPos,   orig_GameInput_get_WorldPos);
+        // Install Hooks
+        #define INSTALL_HOOK(target_rva, hook_fn, orig_ptr) \
+            DobbyHook((void*)(g_il2cpp_base + target_rva), (void*)hook_fn, (void**)&orig_ptr);
 
-    #undef INSTALL_HOOK
+        INSTALL_HOOK(Offsets::SpawnManager_Spawn,       hook_SpawnManager_Spawn,       orig_SpawnManager_Spawn);
+        INSTALL_HOOK(Offsets::ActionManager_AddObject,  hook_ActionManager_AddObject,  orig_ActionManager_AddObject);
+        INSTALL_HOOK(Offsets::ActionManager_ClearWorld, hook_ActionManager_ClearWorld, orig_ActionManager_ClearWorld);
+        INSTALL_HOOK(Offsets::DragTool_StartDrag,       hook_DragTool_StartDrag,       orig_DragTool_StartDrag);
+        INSTALL_HOOK(Offsets::DragTool_MoveDragger,     hook_DragTool_MoveDragger,     orig_DragTool_MoveDragger);
+        INSTALL_HOOK(Offsets::DragTool_EndDrag,         hook_DragTool_EndDrag,         orig_DragTool_EndDrag);
+        INSTALL_HOOK(Offsets::DragTool_Update,          hook_DragTool_Update,          orig_DragTool_Update);
+        INSTALL_HOOK(Offsets::LivingPart_FixedUpdate,   hook_LivingPart_FixedUpdate,   orig_LivingPart_FixedUpdate);
+        INSTALL_HOOK(Offsets::SliceController_SliceAll, hook_SliceController_SliceAll, orig_SliceController_SliceAll);
+        INSTALL_HOOK(Offsets::GameInput_get_WorldPos,   hook_GameInput_get_WorldPos,   orig_GameInput_get_WorldPos);
 
-    LOGI("All Fruit Playground co-op hooks installed successfully!");
+        #undef INSTALL_HOOK
+        LOGI("All Fruit Playground co-op hooks installed successfully!");
+
+        // Auto-show connection dialog at startup after 3 seconds
+        sleep(3);
+        ShowInputDialog();
+
+        return nullptr;
+    }, nullptr);
+    pthread_detach(init_thread);
 }
